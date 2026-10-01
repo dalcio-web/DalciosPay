@@ -1,0 +1,8 @@
+{
+  "name": "DalciosPay",
+  "description": "A modern, minimalist personal finance dashboard for tracking expenses and managing monthly salary with real-time reality checks.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

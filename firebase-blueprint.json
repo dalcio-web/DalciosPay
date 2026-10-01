@@ -1,0 +1,54 @@
+{
+  "entities": {
+    "MonthData": {
+      "title": "Month Data",
+      "description": "Financial data for a specific month",
+      "type": "object",
+      "properties": {
+        "salary": { "type": "number", "description": "Base salary for the month" },
+        "extraIncomes": { 
+          "type": "array", 
+          "items": { "type": "object", "properties": {
+            "id": { "type": "string" },
+            "description": { "type": "string" },
+            "amount": { "type": "number" },
+            "date": { "type": "string" }
+          }}
+        },
+        "expenses": {
+          "type": "array",
+          "items": { "type": "object", "properties": {
+            "id": { "type": "string" },
+            "description": { "type": "string" },
+            "amount": { "type": "number" },
+            "category": { "type": "string", "enum": ["Fixas", "Variáveis"] },
+            "paid": { "type": "boolean" },
+            "dueDate": { "type": "string" },
+            "installmentNumber": { "type": "number" },
+            "totalInstallments": { "type": "number" }
+          }}
+        },
+        "piggyBank": {
+          "type": "array",
+          "items": { "type": "object", "properties": {
+            "id": { "type": "string" },
+            "description": { "type": "string" },
+            "amount": { "type": "number" },
+            "date": { "type": "string" }
+          }}
+        }
+      },
+      "required": ["salary", "extraIncomes", "expenses", "piggyBank"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}/months/{monthId}": {
+      "schema": "MonthData",
+      "description": "Stored financial data for a user in a specific month"
+    },
+    "/users/{userId}/trips/{tripId}": {
+      "schema": "TripProject",
+      "description": "Stored travel project data for a user"
+    }
+  }
+}
