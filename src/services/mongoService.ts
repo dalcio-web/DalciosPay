@@ -1,8 +1,11 @@
-import { supabase } from '../lib/supabase';
 import { auth } from '../lib/firebase';
 import { MonthData } from '../types';
 
 export interface DbStatus {
+  mariadb: {
+    configured: boolean;
+    connected: boolean;
+  };
   mongodb: {
     configured: boolean;
     connected: boolean;
@@ -11,10 +14,10 @@ export interface DbStatus {
     configured: boolean;
     connected: boolean;
   };
-  activeDb: 'mongodb' | 'supabase';
+  activeDb: 'mariadb' | 'mongodb' | 'supabase';
 }
 
-// Simple helper to fetch the current session's JWT (supports Firebase, Supabase, or local session)
+// Fetch the verified Firebase session token used by the backend.
 async function getAuthHeaders(): Promise<HeadersInit> {
   let token = '';
   if (auth.currentUser) {
@@ -25,24 +28,7 @@ async function getAuthHeaders(): Promise<HeadersInit> {
     }
   }
 
-  if (!token) {
-    const savedSession = localStorage.getItem('dalciospay_user_session');
-    if (savedSession) {
-      try {
-        const parsed = JSON.parse(savedSession);
-        token = parsed.uid || parsed.email || '';
-      } catch (e) {}
-    }
-  }
-
-  if (!token) {
-    try {
-      const { data: { session } } = await supabase.auth.getSession();
-      token = session?.access_token || '';
-    } catch (err) {
-      console.warn('[MongoService] Failed to retrieve Supabase session:', err);
-    }
-  }
+  if (!token) throw new Error('Sessão Firebase não encontrada. Entre novamente.');
 
   return {
     'Content-Type': 'application/json',
@@ -76,14 +62,15 @@ export const mongoService = {
     } catch (err) {
       console.error('[MongoService] getDbStatus failed:', err);
       return {
+        mariadb: { configured: false, connected: false },
         mongodb: { configured: false, connected: false },
-        supabase: { configured: true, connected: true },
-        activeDb: 'supabase'
+        supabase: { configured: false, connected: false },
+        activeDb: 'mongodb'
       };
     }
   },
 
-  // Get all months from MongoDB for the current authenticated user
+  // Get all months from the financial backend selected by DATA_BACKEND.
   async getAllMonthsData(userId: string): Promise<{ [key: string]: MonthData }> {
     const headers = await getAuthHeaders();
     const response = await fetch('/api/months', {
@@ -92,13 +79,13 @@ export const mongoService = {
     });
 
     if (!response.ok) {
-      await handleFetchError(response, 'Erro ao carregar dados do MongoDB.');
+      await handleFetchError(response, 'Erro ao carregar os dados financeiros.');
     }
 
     return await response.json();
   },
 
-  // Save a specific month to MongoDB
+  // Save a specific month to the selected financial backend.
   async saveMonthData(userId: string, monthId: string, data: MonthData): Promise<void> {
     const headers = await getAuthHeaders();
     const response = await fetch(`/api/months/${monthId}`, {

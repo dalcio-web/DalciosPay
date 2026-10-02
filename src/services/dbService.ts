@@ -18,9 +18,10 @@ async function getStatus(): Promise<DbStatus> {
     return status;
   } catch (err) {
     return {
+      mariadb: { configured: false, connected: false },
       mongodb: { configured: false, connected: false },
-      supabase: { configured: true, connected: true },
-      activeDb: 'supabase'
+      supabase: { configured: false, connected: false },
+      activeDb: 'mongodb'
     };
   }
 }
@@ -36,7 +37,7 @@ export const dbService = {
     return await getStatus();
   },
 
-  async getActiveDb(): Promise<'mongodb' | 'supabase'> {
+  async getActiveDb(): Promise<'mariadb' | 'mongodb' | 'supabase'> {
     const status = await getStatus();
     return status.activeDb;
   },
@@ -45,43 +46,12 @@ export const dbService = {
     const status = await getStatus();
     console.log(`[dbService] Fetching all months data using: ${status.activeDb}`);
     
-    if (status.activeDb === 'mongodb') {
-      try {
-        const mongoData = await mongoService.getAllMonthsData(userId);
-        
-        // If MongoDB contains monthly data, return them immediately
-        if (Object.keys(mongoData).length > 0) {
-          console.log(`[dbService] Loaded ${Object.keys(mongoData).length} months successfully from MongoDB.`);
-          return mongoData;
-        }
-
-        // MongoDB is the active database but it's empty! 
-        // Let's check if there is data in Supabase that we should automatically migrate
-        if (status.supabase?.configured && status.supabase?.connected) {
-          console.log('[dbService] MongoDB is configured but empty. Checking if Supabase contains old records to migrate...', userId);
-          const supabaseData = await supabaseService.getAllMonthsData(userId);
-          
-          if (Object.keys(supabaseData).length > 0) {
-            console.log(`[dbService] Found ${Object.keys(supabaseData).length} months in Supabase. Migrating to MongoDB automatically...`);
-            try {
-              await mongoService.migrateAll(userId, supabaseData);
-              console.log('[dbService] Automated MongoDB migration succeeded!');
-              return supabaseData;
-            } catch (migrateErr: any) {
-              console.error('[dbService] Automated migration failed, showing Supabase data as fallback:', migrateErr.message);
-              return supabaseData;
-            }
-          }
-        }
-
-        return mongoData;
-      } catch (err) {
-        console.warn('[dbService] Mongo fetch failed:', err);
-      }
+    if (status.activeDb === 'mongodb' || status.activeDb === 'mariadb') {
+      return await mongoService.getAllMonthsData(userId);
     }
     
     // Default fallback to Supabase only if configured
-    if (status.supabase?.configured) {
+    if (status.activeDb === 'supabase' && status.supabase?.configured) {
       return await supabaseService.getAllMonthsData(userId);
     }
 
@@ -92,17 +62,12 @@ export const dbService = {
     const status = await getStatus();
     console.log(`[dbService] Saving month data (${monthId}) using: ${status.activeDb}`);
 
-    if (status.activeDb === 'mongodb') {
-      try {
-        return await mongoService.saveMonthData(userId, monthId, data);
-      } catch (err: any) {
-        console.error('[dbService] Mongo save failed:', err.message);
-        throw err;
-      }
+    if (status.activeDb === 'mongodb' || status.activeDb === 'mariadb') {
+      return await mongoService.saveMonthData(userId, monthId, data);
     }
 
     // Default to Supabase if configured
-    if (status.supabase?.configured) {
+    if (status.activeDb === 'supabase' && status.supabase?.configured) {
       return await supabaseService.saveMonthData(userId, monthId, data);
     }
   },

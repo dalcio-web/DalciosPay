@@ -4,13 +4,25 @@ import { createServer as createViteServer } from "vite";
 import { createClient } from "@supabase/supabase-js";
 import { GoogleGenAI, Type } from "@google/genai";
 import dotenv from "dotenv";
+import { getAuthenticatedUser, requireFirebaseAuth, type AuthenticatedRequest } from "./src/server/auth";
+import { PERMISSIONS, requirePermission } from "./src/server/rbac";
+import { getSelectedDataBackend, isMariaDbConfigured } from "./src/server/dataBackend";
+import {
+  checkMariaDbConnection,
+  getAllMariaDbMonths,
+  saveAllMariaDbMonths,
+  saveMariaDbMonth,
+} from "./src/server/mariaDbFinancialRepository";
 
 dotenv.config();
 
 console.log("[Server Startup] Variáveis encontradas:", Object.keys(process.env).filter(k => k.startsWith('VITE_') || k.includes('SUPABASE')));
 
 const app = express();
-const PORT = 3000;
+const PORT = Number(process.env.PORT || 3000);
+if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535) {
+  throw new Error('PORT inválida.');
+}
 
 // Increase limit of body parsers to handle large migration payloads
 app.use(express.json({ limit: "50mb" }));
@@ -72,50 +84,8 @@ const MongoDBMonth = MongoDBMonthRaw as any;
 
 // Middleware/helper to verify JWT or auth token
 const getAuthenticatedUserId = async (req: express.Request): Promise<string | null> => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return null;
-  }
-  const token = authHeader.split(' ')[1];
-  if (!token || token === 'undefined' || token === 'null' || token.trim() === '') {
-    return null;
-  }
-
-  // 1. Try parsing token as JWT (Firebase, Supabase, or custom JWT)
-  try {
-    const parts = token.split('.');
-    if (parts.length >= 2) {
-      const payloadBase64 = parts[1];
-      const payloadJson = Buffer.from(payloadBase64, 'base64').toString('utf8');
-      const jwt = JSON.parse(payloadJson);
-      if (jwt) {
-        const uid = jwt.user_id || jwt.sub || jwt.uid;
-        if (uid) return uid;
-      }
-    }
-  } catch (err) {
-    // Not a valid JWT or parse error, fall through
-  }
-
-  // 2. Fallback check for Supabase session if Supabase is configured
-  const supabase = getSupabase();
-  if (supabase) {
-    try {
-      const { data: { user }, error } = await supabase.auth.getUser(token);
-      if (!error && user) {
-        return user.id;
-      }
-    } catch (err) {
-      // Supabase verification error
-    }
-  }
-
-  // 3. Fallback for custom user session or string token
-  if (token && token.length > 0) {
-    return token;
-  }
-
-  return null;
+  const user = await getAuthenticatedUser(req);
+  return user?.uid ?? null;
 };
 
 // Public configuration endpoint
@@ -127,12 +97,34 @@ app.get("/api/config", (req, res) => {
   });
 });
 
+app.get("/api/auth/me", requireFirebaseAuth, (req: AuthenticatedRequest, res) => {
+  res.json({
+    uid: req.authUser!.uid,
+    email: req.authUser!.email ?? null,
+    emailVerified: req.authUser!.email_verified ?? false,
+  });
+});
+
+app.get(
+  "/api/admin/security-check",
+  requireFirebaseAuth,
+  requirePermission(PERMISSIONS.ADMIN_ACCESS),
+  (req: AuthenticatedRequest, res) => {
+    res.json({ status: "ok", uid: req.authUser!.uid });
+  },
+);
+
 // Returns status of database configurations
 app.get("/api/db-status", async (req, res) => {
   try {
+    const activeDb = getSelectedDataBackend();
+    const mariaConfigured = isMariaDbConfigured();
+    const mariaConnected = activeDb === 'mariadb' && mariaConfigured
+      ? await checkMariaDbConnection()
+      : false;
     const hasMongoUri = !!(process.env.MONGODB_URI || process.env.MONGO_URI);
     let mongoConnected = false;
-    if (hasMongoUri) {
+    if (activeDb === 'mongodb' && hasMongoUri) {
       mongoConnected = await connectToMongoDB();
     }
     
@@ -141,6 +133,10 @@ app.get("/api/db-status", async (req, res) => {
     const supabaseConfigured = !!(config.url && config.key);
     
     res.json({
+      mariadb: {
+        configured: mariaConfigured,
+        connected: mariaConnected,
+      },
       mongodb: {
         configured: hasMongoUri,
         connected: mongoConnected,
@@ -149,20 +145,21 @@ app.get("/api/db-status", async (req, res) => {
         configured: supabaseConfigured,
         connected: !!supabaseClient
       },
-      activeDb: (hasMongoUri && mongoConnected) ? 'mongodb' : 'supabase'
+      activeDb,
     });
   } catch (err: any) {
     console.error("[API] Error in /api/db-status:", err);
     res.status(500).json({
       error: err.message,
+      mariadb: { configured: isMariaDbConfigured(), connected: false },
       mongodb: { configured: false, connected: false },
       supabase: { configured: false, connected: false },
-      activeDb: 'supabase'
+      activeDb: process.env.DATA_BACKEND || 'mongodb'
     });
   }
 });
 
-// GET all months from MongoDB for an authorized user
+// GET all months from the explicitly selected financial backend.
 app.get("/api/months", async (req, res) => {
   const userId = await getAuthenticatedUserId(req);
   if (!userId) {
@@ -170,6 +167,10 @@ app.get("/api/months", async (req, res) => {
   }
 
   try {
+    if (getSelectedDataBackend() === 'mariadb') {
+      return res.json(await getAllMariaDbMonths(userId));
+    }
+
     const isConnected = await connectToMongoDB();
     if (!isConnected) {
       return res.status(503).json({ error: "Serviço MongoDB indisponível no momento." });
@@ -229,7 +230,7 @@ app.get("/api/months", async (req, res) => {
   }
 });
 
-// POST to save/upsert a specific month in MongoDB
+// POST to save/upsert a specific month in the selected financial backend.
 app.post("/api/months/:monthId", async (req, res) => {
   const userId = await getAuthenticatedUserId(req);
   if (!userId) {
@@ -240,6 +241,11 @@ app.post("/api/months/:monthId", async (req, res) => {
   const monthData = req.body;
 
   try {
+    if (getSelectedDataBackend() === 'mariadb') {
+      await saveMariaDbMonth(userId, monthId, monthData);
+      return res.json({ status: "success", monthId });
+    }
+
     const isConnected = await connectToMongoDB();
     if (!isConnected) {
       return res.status(503).json({ error: "Conexão com o MongoDB falhou." });
@@ -279,6 +285,11 @@ app.post("/api/migrate-all", async (req, res) => {
   }
 
   try {
+    if (getSelectedDataBackend() === 'mariadb') {
+      await saveAllMariaDbMonths(userId, months);
+      return res.json({ status: "success", message: `${Object.keys(months).length} meses gravados no MariaDB.` });
+    }
+
     const isConnected = await connectToMongoDB();
     if (!isConnected) {
       return res.status(503).json({ error: "Conexão com o MongoDB falhou." });
@@ -292,6 +303,7 @@ app.post("/api/migrate-all", async (req, res) => {
           expenses: data.expenses || [],
           extraIncomes: data.extraIncomes || [],
           piggyBank: data.piggyBank || [],
+          investments: data.investments || [],
           updatedAt: new Date()
         },
         { upsert: true }

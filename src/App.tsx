@@ -85,7 +85,6 @@ import {
   onAuthStateChanged, 
   signOut, 
   signInWithEmailAndPassword,
-  createUserWithEmailAndPassword,
   type User 
 } from 'firebase/auth';
 import { 
@@ -599,6 +598,7 @@ export default function App() {
   const [isLoggingIn, setIsLoggingIn] = useState(false);
   const [authProvider, setAuthProvider] = useState<'firebase' | 'supabase'>('firebase');
   const [dbStatus, setDbStatus] = useState<any>(null);
+  const isServerDatabase = dbStatus?.activeDb === 'mongodb' || dbStatus?.activeDb === 'mariadb';
 
   const isSupabaseEnabled = useMemo(() => {
     // 1. Verificação das variáveis estáticas do Vite
@@ -622,6 +622,8 @@ export default function App() {
     
     return !isUrlPlaceholder && !isKeyPlaceholder && activeUrl.startsWith('http');
   }, []);
+
+  const useSupabaseAuth = import.meta.env.VITE_AUTH_PROVIDER === 'supabase' && isSupabaseEnabled;
 
   // Supabase Keep-Alive
   useEffect(() => {
@@ -660,7 +662,7 @@ export default function App() {
     testConnection();
 
     // Try Supabase first if enabled
-    if (isSupabaseEnabled) {
+    if (useSupabaseAuth) {
       supabase.auth.getSession().then(({ data: { session } }) => {
         if (session) {
           setUser(session.user);
@@ -678,38 +680,26 @@ export default function App() {
       return () => subscription.unsubscribe();
     } else {
       return onAuthStateChanged(auth, (u) => {
-        if (u) {
-          setUser(u);
-        } else {
-          const savedSession = localStorage.getItem('dalciospay_user_session');
-          if (savedSession) {
-            try {
-              setUser(JSON.parse(savedSession));
-            } catch (e) {
-              setUser(null);
-            }
-          } else {
-            setUser(null);
-          }
-        }
+        setUser(u);
         setAuthProvider('firebase');
         setIsAuthLoading(false);
       });
     }
-  }, [isSupabaseEnabled]);
+  }, [useSupabaseAuth]);
 
   // Sync Logic
   useEffect(() => {
-    if (!user) return;
+    // Never guess the data source while the backend status is still loading.
+    if (!user || !dbStatus) return;
 
     const uId = user.uid || (user as any).id;
 
-    if (dbStatus?.activeDb === 'mongodb') {
-      const syncFromMongoDB = async () => {
+    if (isServerDatabase) {
+      const syncFromServerDatabase = async () => {
         if (isSyncing) return;
         setIsSyncing(true);
         try {
-          // Initial Load from MongoDB
+          // Initial load from the backend selected by DATA_BACKEND.
           const remoteMonthsData = await dbService.getAllMonthsData(uId);
           
           if (Object.keys(remoteMonthsData).length > 0) {
@@ -717,15 +707,16 @@ export default function App() {
               ...prev,
               months: { ...prev.months, ...remoteMonthsData }
             }));
-            showNotification('Seus dados da nuvem (MongoDB) foram carregados.', 'success');
+            const databaseName = dbStatus.activeDb === 'mariadb' ? 'MariaDB' : 'MongoDB';
+            showNotification(`Seus dados da nuvem (${databaseName}) foram carregados.`, 'success');
           }
         } catch (error: any) {
-          console.error("MongoDB initial load error:", error);
+          console.error("Server database initial load error:", error);
         } finally {
           setIsSyncing(false);
         }
       };
-      syncFromMongoDB();
+      syncFromServerDatabase();
       return;
     }
 
@@ -816,7 +807,7 @@ export default function App() {
     try {
       showNotification('Preparando sincronização...', 'success');
       
-      if (dbStatus?.activeDb === 'mongodb') {
+      if (isServerDatabase) {
         const monthIds = Object.keys(state.months);
         if (monthIds.length === 0) {
           showNotification('Você não tem dados locais para guardar.');
@@ -947,7 +938,7 @@ export default function App() {
       showNotification('Buscando dados na nuvem...', 'success');
       
       let remoteData: { [key: string]: MonthData } = {};
-      if (dbStatus?.activeDb === 'mongodb') {
+      if (isServerDatabase) {
         remoteData = await dbService.getAllMonthsData(uId);
       } else if (authProvider === 'firebase') {
         const q = query(collection(db, 'users', uId, 'months'));
@@ -1032,7 +1023,7 @@ export default function App() {
           showNotification('Salvando dados importados na nuvem... Não feche o app.', 'success');
           const monthIds = Object.keys(importedMonths);
           
-          if (dbStatus?.activeDb === 'mongodb') {
+          if (isServerDatabase) {
             for (const mid of monthIds) {
               await dbService.saveMonthData(uId, mid, importedMonths[mid]);
             }
@@ -1067,53 +1058,16 @@ export default function App() {
       if (username && password) {
         const email = username.includes('@') ? username : `${username}@gmail.com`;
         
-        if (isSupabaseEnabled) {
-          let { error, data } = await supabase.auth.signInWithPassword({
+        if (useSupabaseAuth) {
+          const { error } = await supabase.auth.signInWithPassword({
             email,
             password
           });
           
-          // Lógica para auto-criar o usuário solicitado se ele ainda não existir no Supabase
-          if (error && 
-              (error.message.includes('Invalid login credentials') || error.message.includes('User not found')) && 
-              username === 'dalcioweb' && 
-              password === 'Dada212401e0!') {
-            
-            const { error: signUpError } = await supabase.auth.signUp({
-              email,
-              password,
-              options: {
-                data: {
-                  username: 'dalcioweb'
-                }
-              }
-            });
-
-            if (!signUpError) {
-              // Tenta logar novamente após o registro automático
-              const retry = await supabase.auth.signInWithPassword({ email, password });
-              error = retry.error;
-            }
-          }
-          
           if (error) {
-            // Se o erro for apenas e-mail não confirmado para o usuário admin, vamos considerar como sucesso 
-            // e deixar o Supabase gerenciar a sessão se possível, ou alertar o usuário de forma amigável.
-            if (error.message.includes('Email not confirmed')) {
-              console.warn("Aviso: E-mail não confirmado, mas permitindo acesso experimental.");
-              showNotification('Conta preparada! Mas ATENÇÃO: Verifique seu e-mail agora para confirmar e permitir salvar seus dados na nuvem.', 'error');
-              
-              // Tenta pegar o usuário mesmo sem sessão completa para permitir uso local
-              const { data: { user: localUser } } = await supabase.auth.getUser();
-              if (localUser) setUser(localUser);
-              
-              setIsLoggingIn(false);
-              return;
-            } else {
-              console.error("Supabase Login Error:", error);
-              showNotification(`Erro: ${error.message === 'Invalid login credentials' ? 'Usuário ou senha incorretos' : error.message}`);
-              throw error;
-            }
+            console.error("Supabase Login Error:", error);
+            showNotification(`Erro: ${error.message === 'Invalid login credentials' ? 'Usuário ou senha incorretos' : error.message}`);
+            throw error;
           }
           
           showNotification('Acesso concedido!', 'success');
@@ -1123,62 +1077,20 @@ export default function App() {
             const userCredential = await signInWithEmailAndPassword(auth, email, password);
             setUser(userCredential.user);
             setAuthProvider('firebase');
-            localStorage.removeItem('dalciospay_user_session');
             showNotification('Acesso concedido!', 'success');
           } catch (firebaseErr: any) {
             console.warn("[Firebase Auth] signInWithEmailAndPassword error:", firebaseErr);
-            
-            // Se o provedor de e-mail/senha estiver desativado no Firebase Console, cria sessão local segura
-            if (firebaseErr.code === 'auth/operation-not-allowed') {
-              const customUser = {
-                uid: username.toLowerCase().trim().replace(/[^a-z0-9_-]/g, '_'),
-                email,
-                displayName: username,
-              };
-              setUser(customUser as any);
-              setAuthProvider('firebase');
-              localStorage.setItem('dalciospay_user_session', JSON.stringify(customUser));
-              showNotification('Acesso concedido!', 'success');
-              return;
-            }
-
-            // Tenta criar usuário se for o primeiro acesso ou não encontrado
-            try {
-              console.log("[Firebase Auth] Tentando criar usuário automático...");
-              const userCredential = await createUserWithEmailAndPassword(auth, email, password);
-              setUser(userCredential.user);
-              setAuthProvider('firebase');
-              localStorage.removeItem('dalciospay_user_session');
-              showNotification('Conta criada com sucesso!', 'success');
-              return;
-            } catch (signUpError: any) {
-              console.warn("[Firebase Auth] createUserWithEmailAndPassword error:", signUpError);
-              if (signUpError.code === 'auth/operation-not-allowed' || firebaseErr.code === 'auth/user-not-found' || firebaseErr.code === 'auth/invalid-credential') {
-                const customUser = {
-                  uid: username.toLowerCase().trim().replace(/[^a-z0-9_-]/g, '_'),
-                  email,
-                  displayName: username,
-                };
-                setUser(customUser as any);
-                setAuthProvider('firebase');
-                localStorage.setItem('dalciospay_user_session', JSON.stringify(customUser));
-                showNotification('Acesso concedido!', 'success');
-                return;
-              }
-              
-              let msg = signUpError.message || firebaseErr.message;
-              if (firebaseErr.code === 'auth/invalid-credential' || firebaseErr.code === 'auth/wrong-password') {
-                msg = 'Senha incorreta ou usuário inválido.';
-              }
-              showNotification(`Erro: ${msg}`);
-              throw signUpError;
-            }
+            const safeMessage = firebaseErr.code === 'auth/invalid-credential' || firebaseErr.code === 'auth/wrong-password'
+              ? 'Senha incorreta ou usuário inválido.'
+              : firebaseErr.message;
+            showNotification(`Erro: ${safeMessage}`);
+            throw firebaseErr;
           }
         }
         return;
       }
 
-      if (isSupabaseEnabled) {
+      if (useSupabaseAuth) {
         const { error } = await supabase.auth.signInWithOAuth({
           provider: 'google',
           options: {
@@ -1195,7 +1107,6 @@ export default function App() {
         const userCredential = await signInWithPopup(auth, provider);
         setUser(userCredential.user);
         setAuthProvider('firebase');
-        localStorage.removeItem('dalciospay_user_session');
         showNotification('Bem-vindo!', 'success');
       }
     } catch (error: any) {
@@ -1207,7 +1118,6 @@ export default function App() {
   };
 
   const logout = async () => {
-    localStorage.removeItem('dalciospay_user_session');
     if (authProvider === 'supabase') {
       await supabase.auth.signOut();
     } else {
@@ -1480,7 +1390,7 @@ export default function App() {
       setIsSyncing(true);
       const uId = user.uid || (user as any).id;
       try {
-        if (dbStatus?.activeDb === 'mongodb') {
+        if (isServerDatabase) {
           const jobs = affectedMonthIds.map(mid => 
             dbService.saveMonthData(uId, mid, newState.months[mid])
           );
@@ -1497,7 +1407,7 @@ export default function App() {
           await Promise.all(jobs);
         }
       } catch (error: any) {
-        if (authProvider === 'firebase' && dbStatus?.activeDb !== 'mongodb') {
+        if (authProvider === 'firebase' && !isServerDatabase) {
           handleFirestoreError(error, OperationType.WRITE, `users/${uId}/months/multiple`, user);
         } else {
           console.error(error);
@@ -1587,7 +1497,7 @@ export default function App() {
       setIsSyncing(true);
       const uId = user.uid || (user as any).id;
       try {
-        if (dbStatus?.activeDb === 'mongodb') {
+        if (isServerDatabase) {
           const jobs = affectedMonthIds.map(mid =>
             dbService.saveMonthData(uId, mid, newState.months[mid])
           );
@@ -1604,7 +1514,7 @@ export default function App() {
           await Promise.all(jobs);
         }
       } catch (error: any) {
-        if (authProvider === 'firebase' && dbStatus?.activeDb !== 'mongodb') {
+        if (authProvider === 'firebase' && !isServerDatabase) {
           handleFirestoreError(error, OperationType.WRITE, `users/${uId}/months/multiple`, user);
         } else {
           console.error(error);
@@ -1873,7 +1783,7 @@ export default function App() {
           extraIncomes: [income, ...(targetMonth.extraIncomes || [])]
         };
 
-        if (dbStatus?.activeDb === 'mongodb') {
+        if (isServerDatabase) {
           await dbService.saveMonthData(uId, targetMonthId, finalData);
         } else if (authProvider === 'firebase') {
           await setDoc(doc(db, 'users', uId, 'months', targetMonthId), sanitize(finalData));
@@ -1943,7 +1853,7 @@ export default function App() {
       setIsSyncing(true);
       const uId = user.uid || (user as any).id;
       try {
-        if (dbStatus?.activeDb === 'mongodb') {
+        if (isServerDatabase) {
           await dbService.saveMonthData(uId, currentMonthId, finalData);
         } else if (authProvider === 'firebase') {
           const path = `users/${uId}/months/${currentMonthId}`;
@@ -1952,7 +1862,7 @@ export default function App() {
           await dbService.saveMonthData(uId, currentMonthId, finalData);
         }
       } catch (err: any) {
-        if (authProvider === 'firebase' && dbStatus?.activeDb !== 'mongodb') {
+        if (authProvider === 'firebase' && !isServerDatabase) {
           handleFirestoreError(err, OperationType.WRITE, `users/${uId}/months/${currentMonthId}`, user);
         } else {
           console.error("Database Sync Error:", err);
@@ -2035,7 +1945,7 @@ export default function App() {
       setIsSyncing(true);
       const uId = user.uid || (user as any).id;
       try {
-        if (dbStatus?.activeDb === 'mongodb') {
+        if (isServerDatabase) {
           await dbService.saveMonthData(uId, nextMonthId, updatedTarget);
         } else if (authProvider === 'firebase') {
           await setDoc(doc(db, `users/${uId}/months/${nextMonthId}`), sanitize(updatedTarget));
@@ -2139,7 +2049,7 @@ export default function App() {
       setIsSyncing(true);
       const uId = user.uid || (user as any).id;
       try {
-        if (dbStatus?.activeDb === 'mongodb') {
+        if (isServerDatabase) {
           await dbService.saveMonthData(uId, targetMonthId, updatedMonthData);
         } else if (authProvider === 'firebase') {
           await setDoc(doc(db, 'users', uId, 'months', targetMonthId), sanitize(updatedMonthData));
@@ -2323,7 +2233,7 @@ export default function App() {
       const uId = user.uid || (user as any).id;
       try {
         const jobs = targetMonthIds.map(mId => {
-          if (dbStatus?.activeDb === 'mongodb') {
+          if (isServerDatabase) {
             return dbService.saveMonthData(uId, mId, newState.months[mId]);
           } else if (authProvider === 'firebase') {
             return setDoc(doc(db, 'users', uId, 'months', mId), sanitize(newState.months[mId]));
@@ -2416,7 +2326,7 @@ export default function App() {
       const uId = user.uid || (user as any).id;
       try {
         const jobs = affectedMonthIds.map(mId => {
-          if (dbStatus?.activeDb === 'mongodb') {
+          if (isServerDatabase) {
             return dbService.saveMonthData(uId, mId, updatedMonths[mId]);
           } else if (authProvider === 'firebase') {
             return setDoc(doc(db, 'users', uId, 'months', mId), sanitize(updatedMonths[mId]));
@@ -2579,7 +2489,7 @@ export default function App() {
       try {
         const listToSync = Array.from(affectedMonthIds);
         const jobs = listToSync.map(mId => {
-          if (dbStatus?.activeDb === 'mongodb') {
+          if (isServerDatabase) {
             return dbService.saveMonthData(uId, mId, newState.months[mId]);
           } else if (authProvider === 'firebase') {
             return setDoc(doc(db, 'users', uId, 'months', mId), sanitize(newState.months[mId]));
@@ -2827,7 +2737,7 @@ export default function App() {
       setIsSyncing(true);
       const uId = user.uid || (user as any).id;
       try {
-        if (dbStatus?.activeDb === 'mongodb') {
+        if (isServerDatabase) {
           await dbService.saveMonthData(uId, nextMonthId, updatedMonthData!);
         } else if (authProvider === 'firebase') {
           await setDoc(doc(db, 'users', uId, 'months', nextMonthId), sanitize(updatedMonthData!));
@@ -2835,7 +2745,7 @@ export default function App() {
           await dbService.saveMonthData(uId, nextMonthId, updatedMonthData!);
         }
       } catch (err: any) {
-        if (authProvider === 'firebase' && dbStatus?.activeDb !== 'mongodb') {
+        if (authProvider === 'firebase' && !isServerDatabase) {
           handleFirestoreError(err, OperationType.WRITE, `users/${uId}/months/${nextMonthId}`, user);
         } else {
           console.error(err);
@@ -2891,7 +2801,7 @@ export default function App() {
       setIsSyncing(true);
       const uId = user.uid || (user as any).id;
       try {
-        if (dbStatus?.activeDb === 'mongodb') {
+        if (isServerDatabase) {
           await dbService.saveMonthData(uId, nextMonthId, updatedMonthData!);
         } else if (authProvider === 'firebase') {
           await setDoc(doc(db, 'users', uId, 'months', nextMonthId), sanitize(updatedMonthData!));
@@ -2899,7 +2809,7 @@ export default function App() {
           await dbService.saveMonthData(uId, nextMonthId, updatedMonthData!);
         }
       } catch (err: any) {
-        if (authProvider === 'firebase' && dbStatus?.activeDb !== 'mongodb') {
+        if (authProvider === 'firebase' && !isServerDatabase) {
           handleFirestoreError(err, OperationType.WRITE, `users/${uId}/months/${nextMonthId}`, user);
         } else {
           console.error(err);
@@ -3012,7 +2922,7 @@ export default function App() {
       const uId = user.uid || (user as any).id;
       try {
         const jobs = affectedMonthIds.map(mId => {
-          if (dbStatus?.activeDb === 'mongodb') {
+          if (isServerDatabase) {
             return dbService.saveMonthData(uId, mId, newState.months[mId]);
           } else if (authProvider === 'firebase') {
             return setDoc(doc(db, 'users', uId, 'months', mId), sanitize(newState.months[mId]));
@@ -3022,7 +2932,7 @@ export default function App() {
         });
         await Promise.all(jobs);
       } catch (err: any) {
-        if (authProvider === 'firebase' && dbStatus?.activeDb !== 'mongodb') {
+        if (authProvider === 'firebase' && !isServerDatabase) {
           handleFirestoreError(err, OperationType.WRITE, `users/${uId}/months/${currentMonthId}`, user);
         } else {
           console.error(err);
@@ -6531,7 +6441,7 @@ export default function App() {
                 <div className="flex items-center justify-between mt-1.5">
                   <span className="text-xs font-extrabold text-brand-text-main flex items-center gap-1.5">
                     <Database size={12} className="text-brand-primary" />
-                    BD Ativo: <span className="text-brand-primary">{dbStatus?.activeDb === 'mongodb' ? 'MongoDB' : authProvider === 'firebase' ? 'Firebase' : 'Supabase'}</span>
+                    BD Ativo: <span className="text-brand-primary">{dbStatus?.activeDb === 'mariadb' ? 'MariaDB' : dbStatus?.activeDb === 'mongodb' ? 'MongoDB' : authProvider === 'firebase' ? 'Firebase' : 'Supabase'}</span>
                   </span>
                   <span className="flex h-2 w-2 relative">
                     <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
@@ -6543,7 +6453,7 @@ export default function App() {
               <div className="text-[10px] space-y-1 bg-brand-bg-accent/40 p-2.5 rounded-xl border border-brand-border/40 font-mono text-brand-text-muted">
                 {authProvider === 'firebase' && (
                   <div className="flex justify-between items-center border-b border-brand-border/30 pb-1 mb-1">
-                    <span>Firebase Firestore:</span>
+                    <span>Firebase Auth:</span>
                     <span className="text-emerald-500 font-bold">CONECTADO 🟢</span>
                   </div>
                 )}
@@ -6553,6 +6463,12 @@ export default function App() {
                       <span>Supabase Cloud:</span>
                       <span className={dbStatus.supabase.connected ? 'text-emerald-500 font-bold' : 'text-red-500 font-bold'}>
                         {dbStatus.supabase.connected ? 'CONECTADO 🟢' : 'DESCONECTADO 🔴'}
+                      </span>
+                    </div>
+                    <div className="flex justify-between items-center pt-0.5">
+                      <span>MariaDB Hostinger:</span>
+                      <span className={dbStatus.mariadb?.connected ? 'text-emerald-500 font-bold' : dbStatus.mariadb?.configured ? 'text-red-500 font-bold' : 'text-amber-500 font-bold'}>
+                        {dbStatus.mariadb?.connected ? 'CONECTADO 🟢' : dbStatus.mariadb?.configured ? 'ERRO CONEXÃO 🔴' : 'NÃO CONFIGURADO ⚠️'}
                       </span>
                     </div>
                     <div className="flex justify-between items-center pt-0.5">
@@ -6579,7 +6495,7 @@ export default function App() {
               )}
 
               {/* Dica amigável de configuração do Atlas */}
-              {!dbStatus?.mongodb.configured && (
+              {dbStatus?.activeDb === 'mongodb' && !dbStatus?.mongodb.configured && (
                 <p className="text-[9px] text-brand-text-muted leading-tight border border-dashed border-brand-border/60 p-2 rounded-lg bg-brand-bg/50">
                   💡 <strong>Dica:</strong> Para ativar o MongoDB, configure a variável <strong>MONGODB_URI</strong> no menu Secrets de seu dashboard.
                 </p>
